@@ -2,11 +2,11 @@
 # IMPORTS — standard library only (good: no external deps)
 # ============================================================
 
-import hmac        # HMAC -> authentication + integrity
-import hashlib     # SHA-256 hashing
+import hmac
+import hashlib
 import os
-import time        # timestamps
-import secrets     # secure randomness (nonce)
+import time
+import secrets
 import json
 from datetime import datetime
 
@@ -42,6 +42,10 @@ def is_timestamp_valid(timestamp: str, tolerance_seconds: int = 30) -> bool:
         return False
 
 
+def now():
+    return datetime.utcnow().isoformat()
+
+
 # ============================================================
 # VAULT
 # ============================================================
@@ -52,11 +56,22 @@ class PasswordVault:
         self._secret = SHARED_SECRET
         self._active_nonces = {}
         self._vault_store = {}
+        self.audit_log = []
+
+    def log_event(self, event, data=None):
+        self.audit_log.append({
+            "time": now(),
+            "event": event,
+            "data": data or {}
+        })
 
     def issue_challenge(self):
         nonce = generate_nonce()
         self._active_nonces[nonce] = time.time()
+
         print(f"[VAULT] Issued nonce: {nonce[:20]}...")
+
+        self.log_event("CHALLENGE_ISSUED", {"nonce": nonce})
         return {"nonce": nonce}
 
     def verify_and_grant(self, token):
@@ -68,40 +83,61 @@ class PasswordVault:
 
         print("[VAULT] Verifying authentication...")
 
-        # Step 1: nonce check
+        # -------------------------
+        # Nonce check
+        # -------------------------
         if nonce not in self._active_nonces:
             print(" ✗ Invalid nonce")
+            self.log_event("AUTH_DENIED", {"reason": "invalid_nonce"})
             return {"status": "denied"}
 
-        # consume nonce
         del self._active_nonces[nonce]
 
-        # Step 2: timestamp
+        # -------------------------
+        # Timestamp check
+        # -------------------------
         if not is_timestamp_valid(timestamp):
             print(" ✗ Timestamp invalid")
+            self.log_event("AUTH_DENIED", {"reason": "invalid_timestamp"})
             return {"status": "denied"}
 
-        # Step 3: HMAC
+        # -------------------------
+        # HMAC check
+        # -------------------------
         expected = compute_hmac(self._secret, nonce, timestamp, request_type)
 
         if not hmac.compare_digest(expected, received):
             print(" ✗ HMAC mismatch (attack detected)")
+            self.log_event("AUTH_DENIED", {"reason": "hmac_mismatch"})
             return {"status": "denied"}
 
         print(" ✓ Authentication successful")
+        self.log_event("AUTH_GRANTED", {"request_type": request_type})
+
         return {"status": "granted"}
 
     def store_record(self, user, site, record):
         if user not in self._vault_store:
             self._vault_store[user] = {}
+
         self._vault_store[user][site] = record
         print("[VAULT] Record stored")
+
+        self.log_event("RECORD_STORED", {"user": user, "site": site})
+
         return {"status": "stored"}
 
     def retrieve_record(self, user, site):
-        record = self._vault_store.get(user, {}).get(site)
         print("[VAULT] Record retrieved")
-        return record
+
+        self.log_event("RECORD_RETRIEVED", {"user": user, "site": site})
+
+        return self._vault_store.get(user, {}).get(site)
+
+    def print_audit_log(self):
+        print("\n[VAULT] -- Audit Log --")
+        for entry in self.audit_log:
+            print(entry)
 
 
 # ============================================================
@@ -118,17 +154,14 @@ class PasswordServer:
 
         print(f"\n[SERVER] Requesting access for: {request_type}")
 
-        # Step 1
         challenge = self._vault.issue_challenge()
         nonce = challenge["nonce"]
 
-        # Step 2
         timestamp = current_timestamp()
         hmac_token = compute_hmac(self._secret, nonce, timestamp, request_type)
 
         print(f"[SERVER] Generated HMAC: {hmac_token[:25]}...")
 
-        # Step 3
         token = {
             "nonce": nonce,
             "timestamp": timestamp,
@@ -136,7 +169,6 @@ class PasswordServer:
             "hmac_token": hmac_token,
         }
 
-        # Step 4
         result = self._vault.verify_and_grant(token)
         return result["status"] == "granted"
 
@@ -154,9 +186,9 @@ def demo():
     vault = PasswordVault()
     server = PasswordServer(vault)
 
-    # --------------------------------------------------------
-    # SUCCESS CASE
-    # --------------------------------------------------------
+    # -------------------------
+    # SUCCESS
+    # -------------------------
     print("\n--- SUCCESSFUL AUTHENTICATION ---")
 
     if server.authenticate("STORE_RECORD"):
@@ -167,10 +199,10 @@ def demo():
         print("[SERVER] Retrieved:", json.dumps(data, indent=2))
 
 
-    # --------------------------------------------------------
-    # ATTACK 1 — WRONG SECRET
-    # --------------------------------------------------------
-    print("\n--- ATTACK: WRONG SECRET ---")
+    # -------------------------
+    # ATTACK 1 — IMPERSONATION
+    # -------------------------
+    print("\n--- ATTACK: WRONG SECRET (IMPERSONATION) ---")
 
     challenge = vault.issue_challenge()
 
@@ -192,9 +224,9 @@ def demo():
     print(vault.verify_and_grant(fake_token))
 
 
-    # --------------------------------------------------------
-    # ATTACK 2 — REPLAY ATTACK
-    # --------------------------------------------------------
+    # -------------------------
+    # ATTACK 2 — REPLAY
+    # -------------------------
     print("\n--- ATTACK: REPLAY ---")
 
     challenge = vault.issue_challenge()
@@ -214,19 +246,24 @@ def demo():
     print(vault.verify_and_grant(token))
 
     print("[ATTACKER] Reusing same token:")
-    print(vault.verify_and_grant(token))  # should fail
+    print(vault.verify_and_grant(token))
 
 
-    # --------------------------------------------------------
+    # -------------------------
     # ATTACK 3 — OLD TIMESTAMP
-    # --------------------------------------------------------
+    # -------------------------
     print("\n--- ATTACK: OLD TIMESTAMP ---")
 
     challenge = vault.issue_challenge()
 
     old_time = str(int(time.time()) - 1000)
 
-    old_hmac = compute_hmac(SHARED_SECRET, challenge["nonce"], old_time, "RETRIEVE_RECORD")
+    old_hmac = compute_hmac(
+        SHARED_SECRET,
+        challenge["nonce"],
+        old_time,
+        "RETRIEVE_RECORD"
+    )
 
     old_token = {
         "nonce": challenge["nonce"],
@@ -236,6 +273,11 @@ def demo():
     }
 
     print(vault.verify_and_grant(old_token))
+
+    # -------------------------
+    # AUDIT LOG OUTPUT
+    # -------------------------
+    vault.print_audit_log()
 
 
 # ============================================================
